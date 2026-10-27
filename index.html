@@ -257,8 +257,50 @@ function requestDB(){return new Promise((resolve,reject)=>{const req=indexedDB.o
 function dbGet(store,key){return new Promise((resolve,reject)=>{const tx=db.transaction(store,'readonly'),r=tx.objectStore(store).get(key);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
 function dbPut(store,key,value){return new Promise((resolve,reject)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).put(value,key);tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Storage write failed'))})}
 function localCommit(payload){return new Promise((resolve,reject)=>{const tx=db.transaction(['state','recovery'],'readwrite'),st=tx.objectStore('state'),hist=tx.objectStore('recovery');let conflict=false;const r=st.get('current');r.onsuccess=()=>{const old=r.result;if((old?.revision||0)!==revision){conflict=true;tx.abort();return}if(old){hist.put({id:uid(),at:timestamp(),payload:old.payload},String(old.revision).padStart(12,'0'));const keys=hist.getAllKeys();keys.onsuccess=()=>keys.result.slice(0,Math.max(0,keys.result.length-5)).forEach(k=>hist.delete(k))}st.put({revision:revision+1,payload},'current')};tx.oncomplete=()=>resolve(revision+1);tx.onerror=()=>reject(tx.error||Error('Device storage failed'));tx.onabort=()=>reject(Error(conflict?'Records changed in another tab. Your changes were not saved. Close this form and use Team & sync → Refresh shared records.':'Device storage is full or unavailable. Download a backup.'))})}
+async function loadBundledBackup(){const response=await fetch('/VELTROX-Complete-Backup-2026-10-27.json',{cache:'no-store'});if(!response.ok)throw Error('Could not load the bundled project JSON. Check that the backup file is included in the deployment.');const data=await response.json(),rows=validateBackup(data),media=data.media||{};for(const p of rows)for(const image of p.images||[]){if(!Object.prototype.hasOwnProperty.call(media,image.id))throw Error('The bundled backup is missing image data for '+image.name);await dbPut('media',image.id,parseDataImage(media[image.id]))}return rows}
 async function api(path,options={}){const res=await fetch('/api/desk'+path,{credentials:'same-origin',cache:'no-store',...options,headers:{[options.body?'Content-Type':'X-Desk-Request']:(options.body?'application/json':'1'),...options.headers}});if(!res.ok){let msg;try{msg=(await res.json()).error}catch{}throw Error(msg||(LOCAL_FILE?'Local server request failed. Check that the local app is still running.':'Cloud request failed. Please sign in and try again.'))}return res.json()}
-async function initialize(){busy(true,'Opening your design desk…');storageReady=false;try{if(CLOUD||LOCAL_FILE){const d=await api('');revision=d.revision;projects=validateBackup(d.payload);cloudUser=d.user;if(LOCAL_FILE)$('storageHelp').textContent='Projects and photos are saved in the JSON file in this folder. Keep a backup before making major changes.';else $('storageHelp').textContent='Shared projects and images are saved in the cloud. Download a backup before major changes. Existing offline records can be moved here with Backup & export → Restore.'}else{db=await requestDB();const stored=await dbGet('state','current');if(stored){revision=stored.revision;projects=validateBackup(stored.payload)}else{let old;try{old=localStorage.getItem(KEY)}catch{}projects=old?validateBackup(JSON.parse(old)):[];revision=await localCommit(backupObject(projects))}}storageReady=true;selected=projects.find(p=>!p.archived)?.id||null;render();setSavedStatus()}catch(e){warn('Cannot open records: '+e.message);projects=[];render()}finally{busy(false)}setInterval(()=>{if(storageReady&&!saving&&!mediaBusy&&!refreshing&&!document.querySelector('dialog[open]'))refreshRecords(false)},20000)}
+async function initialize(){
+ busy(true,'Opening your design desk…');
+ storageReady=false;
+ try{
+  if(CLOUD||LOCAL_FILE){
+   const d=await api('');
+   revision=d.revision;
+   projects=validateBackup(d.payload);
+   cloudUser=d.user;
+   if(LOCAL_FILE)$('storageHelp').textContent='Projects and photos are saved in the JSON file in this folder. Keep a backup before making major changes.';
+   else $('storageHelp').textContent='Shared projects and images are saved in the cloud. Download a backup before major changes. Existing offline records can be moved here with Backup & export → Restore.';
+  }else{
+   db=await requestDB();
+   const stored=await dbGet('state','current');
+   if(stored){
+    revision=stored.revision;
+    projects=validateBackup(stored.payload);
+    if(!projects.length&&revision===1){
+     projects=await loadBundledBackup();
+     revision=await localCommit(backupObject(projects));
+    }
+   }else{
+    let old;
+    try{old=localStorage.getItem(KEY)}catch{}
+    projects=old?validateBackup(JSON.parse(old)):await loadBundledBackup();
+    revision=await localCommit(backupObject(projects));
+   }
+   $('storageHelp').textContent='Projects load from the bundled JSON on first visit, then save in this browser. Changes do not update the deployed file or sync to other devices.';
+  }
+  storageReady=true;
+  selected=projects.find(p=>!p.archived)?.id||null;
+  render();
+  setSavedStatus();
+ }catch(e){
+  warn('Cannot open records: '+e.message);
+  projects=[];
+  render();
+ }finally{
+  busy(false);
+ }
+ setInterval(()=>{if(storageReady&&!saving&&!mediaBusy&&!refreshing&&!document.querySelector('dialog[open]'))refreshRecords(false)},20000);
+}
 function setSavedStatus(){$('saveStatus').innerHTML='<span class="dot"></span>'+(CLOUD?'Cloud saved · shared desk':LOCAL_FILE?'Saved to project JSON':'Saved on this device')}
 async function save(rows,restore=false){if(saving){toast('A save is already in progress. Please try again.',true);return false}if(!storageReady&&(!restore||(!(CLOUD||LOCAL_FILE)&&!db))){toast('Records have not loaded. Refresh the workspace before editing.',true);return false}saving=true;busy(true,'Saving your project…');try{rows=rows.map(validProject);const payload=backupObject(rows);if(CLOUD||LOCAL_FILE){const d=await api('',{method:'PUT',body:JSON.stringify({revision,payload})});revision=d.revision}else revision=await localCommit(payload);projects=rows;$('storageWarning').hidden=true;setSavedStatus();updateBackupReminder();return true}catch(e){$('saveStatus').textContent='Change not saved';toast(e.message,true);return false}finally{saving=false;busy(false)}}
 async function mutate(id,callback,message){const rows=structuredClone(projects),p=rows.find(q=>q.id===id);if(!p)return false;try{callback(p);if(!await save(rows))return false;render();if($('fullDialog').open)renderFull();if(message)toast(message);return true}catch(e){toast(e.message,true);return false}}
